@@ -1,0 +1,400 @@
+---
+title: "Bayesian Modeling with Application to the PGA Tour"
+author: "Nick Bigelow"
+output: 
+  pdf_document:
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rstan)    # If using rstan
+library(ggplot2)  # For enhanced visualization (optional)
+library(bayesplot) # If used later in the document
+library(dplyr)
+posteriors_one <- readRDS("C:/Users/npbig/Downloads/posterior_samples.rds")
+
+```
+
+## Introduction 
+
+The primary purpose of the following document is to discuss and describe various Bayesian model methodologies with application to player specific scores in a PGA Tour round. We will explore a general hierarchical Bayesian model as well as two mixed effects Poisson regression models written in Stan and implemented in R. We will briefly touch on the data, problem statement, limitations, and alternative methodologies.
+
+Golf scores in a round of a PGA tournament can be thought of as the number of strokes it took for a player to finish the round, which can be thought of as count data and modeled using a Poisson distribution. 
+
+## Data
+
+
+Data was obtained using the datagolf API. There are various granularities which can be used in this dataset. Two which come to mind are round level data and tournament level data. 
+
+Round level data gives us player specific metrics such as rolling averages of strokes gained approach, strokes gained tee-to-green, strokes gained putting, etc. 
+
+Tournament level data gives us player tournament metrics such as whether or not they were cut, the course where the tournament was played, the name of the tournament, etc. 
+
+We will not dive too much further into data preparation as the focus is modeling, however there were variables derived to quantify players recent performance. Including, rolling averages of player specific greens in regulation, strokes gained putting, strokes gained driving, etc. 
+
+## Limitations 
+
+A thorough variable selection was not performed, variables were chosen using the developers discretion. Thorough back testing has not been performed. 
+
+More complex hierarchical relationships such as interactions between players and courses, or global score across courses was not explored. 
+
+May of 2024 was the latest available month for data for this project. 
+
+## Model Specification 
+
+### Mixed Effects Poisson Regression: Player Specific Intercepts 
+
+The idea is to model score as a poisson distributed variable, with each golfer has their own intercept. We are also choosing to model a global fixed effect that is based on a 6 round rolling average of a golfers strokes gained tee-to-green, and strokes gained putting. This fixed effect is used as a way to quantify a receny bias. We expecet the coefficients to be negative, as a player is on average gaining strokes on the field over their last 6 rounds we expect them to shoot lower scores. The functional form of our model is shown next: 
+
+\begin{center}
+
+Likelihood Function: $y_{i,g} \sim$ poisson($exp(\mu_g+x_{i,p}*\beta_{i,p})$)
+
+Player level prior: $\mu_g \sim$ normal($\mu_{0g}, \sigma_{0g}$)
+
+Fixed coefficient prior: $\beta_p \sim$ normal(-1,1)
+
+\end{center}
+
+The priors for $\mu_g$ are selected based on historic data respective of each golfer. $\mu_{0g}$ is the average score for golfer g from 2023-01-01 to 2024-05-01 and $\sigma_{0g}$ is the corresponding standard deviation of score for golfer g during that time period. 
+
+The priors for $\beta_p$ were chosen based on an intuition that coefficients should be negative. Our predictor variables, 6 round rolling averages of strokes gained putting and strokes gained tee-to-green, both are expected to have a negative coefficient. 
+
+The stan code for this model is shown below and some of the R code used to fit this stan model is also shown below. The full R code can be found in the github repository under ____. 
+
+```{stan output.var = "compiled_model"}
+data {
+  int<lower=0> N; // number of observations
+  int<lower=1> G; // number of unique players
+  int<lower=0> y[N]; // response variable, scores
+  int<lower=1> P; // number of predictors
+  matrix[N, P] x; // predictor matrix
+  int<lower=1,upper=G> g[N]; // player assignment
+
+  vector<lower=0>[G] mu0; // prior mean for each player's intercept
+  vector<lower=0>[G] sigma0; // prior standard deviation for each player's intercept
+}
+
+parameters {
+  vector[P] beta; // fixed-effect coefficients
+  vector<lower=0>[G] mu_g; // player specific intercepts
+}
+
+model {
+  
+  // Coefficient priors
+  beta ~ normal(-1, 1);
+  
+  // Player specific priors
+  for (j in 1:G){
+    mu_g[j] ~ normal(mu0[j],sigma0[j]);
+  }
+
+  // Likelihood
+  y ~ poisson_log(mu_g[g] + x * beta);
+}
+
+```
+
+```{r,eval=FALSE}
+model <- stan_model("fit_playerL.stan")
+data <- list(N = nrow(train_sample),
+             G = length(unique(train_sample$dg_id_mapped)),
+             y = train_sample$score,
+             P = 2,
+             x = train_sample %>% select(sg_putt_mean_6,
+                                         sg_t2g_mean_6),
+             g = train_sample$dg_id_mapped,
+             mu0 = log(mu0_prior$meanscore),
+             sigma0 = log(sigma0_prior$sdscore))
+
+fit <- sampling(model,data,chains=1,iter=2000)
+```
+
+In the data list, mu0 and sigma0 are input in log form. This is because poisson regression is specified using the log link. Next we will look at some model diagnostics including the number of effective samples, Rhats, and a trace plots of the parameter with the highest Rhat to see how well our estimation has converged. 
+
+```{r,echo=FALSE,fig.width=6,fig.height=3}
+par(mfrow=c(1,2))
+fit <- readRDS("C:/Users/npbig/Downloads/fit_player.rds")
+sumfit <- summary(fit)
+summary_stats <- sumfit$summary
+n_eff <- summary_stats[, "n_eff"]
+rhat <- summary_stats[, "Rhat"]
+
+# Parameter names
+parameters <- rownames(summary_stats)
+
+# Plot n_eff
+plot(n_eff,type = "h",main = "Effective Sample Size (n_eff)",
+     xlab = "Parameter Index",ylab = "n_eff",las = 1)
+# Plot Rhat
+plot(rhat,type = "h",main = "Rhat Diagnostic",xlab = "Parameter Index",
+  ylab = "Rhat",las = 1)
+```
+
+```{r,echo=FALSE,fig.width=6,fig.height=3}
+par(mfrow=c(1,1))
+# Traceplot of highest rhat
+traceplot(fit,"mu_g[178]") + ggtitle("Traceplot of Golfer Index 178")
+```
+
+The parameter estimates appear to have converged well with Rhats generally around 1 and the highest Rhat still showing signs of convergence in its trace plot. Next we will take a look regression coefficient estimates: 
+
+```{r,echo=FALSE,fig.width=6,fig.height=3}
+par(mfrow=c(1,2))
+posterior_samples <- extract(fit)
+
+hist(posterior_samples$beta[,1],
+     main = 'Beta1 Posterior Distribution',
+     xlab = 'Value')
+hist(posterior_samples$beta[,2],
+     main = 'Beta2 Posterior Distribution',
+     xlab = 'Value')
+
+#quantile(posterior_samples$beta[,1],probs = c(0.025,0.975))
+#quantile(posterior_samples$beta[,2],probs = c(0.025,0.975))
+```
+
+Both $\beta_1$ and $\beta_2$ have posterior distributions whose 95% credible intervals overlap 0 and we will not use these elements as predictors. This was somewhat expected as a formal variable selection procedure was not performed.
+
+The goal of these predictor variables was to add a performance recency bias to our model. Instead, we will use a period of 2022-01-01 to 2024-05-01 as a model calibration window. We can then use a prior $\mu_{0g}$ and $\sigma_{0g}$ which are the player level mean and standard deviation of a players score from 2024-01-01 to present. 
+
+Using a prior based on recent data and a likelihood based on a longer period of data will give us this desired recency bias effect. In reality, there will be players who haven't played in 2024 and we will have to use data from earlier for this specific players. For this exercise we will just drop those players from our sample. This then brings us to developing a hierarchical Bayesian model.   
+
+### Hierarchical Bayesian: Player Specific Intercepts 
+
+We will tweak our model specification slightly in light of our predictor variables being insignificant. 
+
+\begin{center}
+
+Likelihood Function: $y_{i,g} \sim$ poisson($\lambda_g$)
+
+Player level prior: $\lambda_g \sim$ gamma($\mu_{0g}*3, 3$)
+
+\end{center}
+
+We have changed the prior distribution to a gamma for our player specific rate, or lambda parameter. Consider the following:
+
+\begin{center}
+
+$\lambda_g \sim$ gamma($\alpha,\beta$) 
+
+$E(\lambda_g) = \frac{\alpha}{\beta} = \frac{3*\mu_{0g}}{3} = \mu_{0g}$
+
+\end{center}
+
+By using the prior specifications of $\alpha = 3 * \mu_{0g}$ and $\beta = 3$ we are specifying the mean of the scoring distribution of player g to be $\mu_g$. This is then scaled by the value of 3 which we will call "c". Lets take a look at some prior predictive plots to see the effect of this scaling constant "c". 
+
+```{r,echo=FALSE}
+# Generate the histogram
+par(mfrow=c(2,2))
+hist(rgamma(1000, 1 * 70, 1), 
+     main = expression(mu == 70 ~ "," ~ c == 1), 
+     xlab = "Values", 
+     ylab = "Frequency")
+hist(rgamma(1000, 3 * 70, 3), 
+     main = expression(mu == 70 ~ "," ~ c == 3), 
+     xlab = "Values", 
+     ylab = "Frequency")
+hist(rgamma(1000, 5 * 70, 5), 
+     main = expression(mu == 70 ~ "," ~ c == 5), 
+     xlab = "Values", 
+     ylab = "Frequency")
+hist(rgamma(1000, 7 * 70, 7), 
+     main = expression(mu == 70 ~ "," ~ c == 7), 
+     xlab = "Values", 
+     ylab = "Frequency")
+
+```
+
+As we hold $\mu_0$ constant and change our scaling parameter c, the spread of the prior distribution we are specifying tightens. 
+
+The lowest score ever in PGA Tour history was a 58 by Jim Furyk at the Travelers Championship in 2016. The highest ever I am not sure of but id venture to that a PGA Tour players average score is less then 80, certainly 85. Because of this range, I am okay with using the tighter c = 7 parameter, while letting player specific averages control $\mu$. 
+
+The stan model for the specifications discussed above is shown below. 
+
+```{stan output.var = "compiled_model"}
+data {
+  int<lower=0> N; // number of observations
+  int<lower=1> G; // number of unique players
+  int<lower=0> y[N]; // response variable, scores
+  int<lower=1,upper=G> g[N]; // player assignment
+
+  vector<lower=0>[G] mu0; // prior mean for each player's intercept
+}
+
+parameters {
+  vector<lower=0>[G] lambda; // player specific means
+}
+
+model {
+
+  // Player specific priors
+  for (j in 1:G){
+    lambda[j] ~ gamma(mu0[j]*7,7);
+  }
+
+  // Likelihood
+  y ~ poisson(lambda[g]);
+}
+
+```
+
+```{r,eval=FALSE}
+model <- stan_model("C:/Users/npbig/Downloads/player_level_fit_player.rds")
+data <- list(N = nrow(train_sample),
+             G = length(unique(train_sample$dg_id_mapped)),
+             y = train_sample$score,
+             g = train_sample$dg_id_mapped,
+             mu0 = mu0_prior$meanscore)
+
+fit <- sampling(model,data,chains=1,iter=2000)
+```
+
+The chains mixed well and all appear to have converged. Next, we will look at the scoring data from 2022-01-01 to present (likelihood), 2024-01-01 to present (prior), and samples from the approximated posterior distribution for a specific golfer.
+
+The golfer we will be looking at is Jon Rahm. During 2022-01-01 to 2024-05-01, our likelihood period, Rahm has an average score on the PGA Tour of 69.91. In more recent history, our prior period, Rahm has had an average score of 73.67. For our exercise we would like the posterior distribution to be weighted with a higher average score to reflect this recent struggle. Plots are shown below. 
+
+```{r,echo=FALSE,fig.width=6,fig.height=3}
+par(mfrow=c(1,3))
+modeling_df <- read.csv("C:/Users/npbig/Downloads/modeling_df_ (2).csv")
+modeling_df <- modeling_df %>% arrange(date)
+modeling_df <-   modeling_df %>% mutate(across(-c(event_name,course_name,player_name,date,teetime), as.numeric))
+modeling_df <- modeling_df %>% subset(total_pts > 0)
+modeling_df$dg_id_mapped <- as.integer(factor(modeling_df$dg_id))
+
+# Split train and test 
+train_sample <- modeling_df %>% subset(date >= '2022-01-01')
+train_sample$dg_id_mapped <- as.integer(factor(train_sample$dg_id))
+train_sample$course_id_mapped <- as.integer(factor(train_sample$course_num))
+
+dgid_joiner <- train_sample %>% select(player_name,dg_id_mapped) 
+dgid_joiner <- unique(dgid_joiner)
+
+fit <- readRDS('C:/Users/npbig/Downloads/player_level_fit_player.rds')
+poster_sampels <- extract(fit)
+
+scottie <- train_sample %>% filter(dg_id_mapped == 298)
+scottie_trim <- train_sample %>% filter(dg_id_mapped == 298 & date > '2024-01-1')
+scottie_prior <- rgamma(3000,7*mean(scottie_trim$score),7)
+
+hist(scottie$score,main = 'Likelihood',xlab = paste0('Mean Score =',round(mean(scottie$score),2)))
+hist(scottie_prior, main = 'Prior',xlab = paste0('Mean Score =',round(mean(scottie_trim$score),2)))
+hist(poster_sampels$lambda[,298],main='Posterior', xlab = paste0('Mean Score =',round(mean(poster_sampels$lambda[,298]),2)))
+```
+
+The posterior distribution appears to be significantly impacted by the likelihood. Lets see what happens when we increase our scaling parameter, c, to 200 in the stan code below.
+
+```{r,eval = F}
+ model {
+ // Player specific priors
+ for (j in 1:G){
+  lambda[j] ~ gamma(mu0[j]*200,200);
+ }
+}
+```
+
+```{r,echo=FALSE,fig.width=6,fig.height=3}
+par(mfrow=c(1,3))
+poster_sampels <- readRDS("C:/Users/npbig/Downloads/playerlevel_posterior_samples_tightprior.rds")
+scottie <- train_sample %>% filter(dg_id_mapped == 298)
+scottie_trim <- train_sample %>% filter(dg_id_mapped == 298 & date > '2024-01-1')
+scottie_prior <- rgamma(3000,200*mean(scottie_trim$score),200)
+
+hist(scottie$score,main = 'Likelihood',xlab = paste0('Mean Score =',round(mean(scottie$score),2)))
+hist(scottie_prior, main = 'Prior',xlab = paste0('Mean Score =',round(mean(scottie_trim$score),2)))
+hist(poster_sampels$lambda[,298],main='Posterior', xlab = paste0('Mean Score =',round(mean(poster_sampels$lambda[,298]),2)))
+```
+
+As you can see, increasing our scaling constant to 200 significantly narrowed the range of our prior specification. This also contributed to the increase of the mean of the posterior distribution and very tight range of posterior distribution. 
+
+In reality this needs some tweaking, the posterior range is roughly between 69 and 72, a wider range probably represents reality better. 
+
+After tweaking this model by potentially using a small scaling constant, one can use it to compare 95% credible intervals for all golfers in the sample.  
+
+### Mixed Effects Poisson Regression: Player & Course Specific Intercepts and Course Specific effects 
+
+An interesting extension of the Bayesian specification could be to include course specific effects and have interaction terms with golfers. The idea being that some golfers score lower at specific courses. A course level intercept could also convey that certain courses have lower scores in general. 
+
+Another interesting extension could be random effects specific to each course. The idea being that some courses are better suited towards golfers who are strong putters, or long drivers, or very accurate in hitting greens in regulation. Using predictor variables such as rolling averages of statistics related to greens in regulation, and strokes gained metrics could be fit using course specific specifications. The functional form of this and the corresponding stan model is shown in the section below.
+
+
+\begin{center}
+
+Likelihood Function: $y_{i,g} \sim$ poisson($exp(\mu_g+\mu_c+(x_{i,p}*\beta_{i,p}))+(x_{i,p,c}*\beta_{i,p,c}))$)
+
+Player level prior: $\mu_g \sim$ normal($\mu_{0g}, \sigma_{0g}$)
+
+Course level prior: $\mu_c \sim$ normal(0,4)
+
+Fixed coefficient prior: $\beta_p \sim$ normal(0,2)
+
+Course coefficient prior: $\beta_{c,p} \sim$ normal(0,2)
+
+\end{center}
+
+The priors remained roughly the same. A normal(0,4) was chosen for the course level intercept.  
+
+This model specification does not include any interaction terms between player and course but it would be an interesting extension to explore. This model was not fit in R however the corresponding stan code can be found below. 
+
+```{stan output.var = "compiled_model"}
+data {
+  int<lower=0> N;           // number of data points
+  int<lower=1> G;           // number of players
+  int<lower=1> C;           // number of courses
+  int<lower=0> y[N];        // scores (count data)
+  int<lower=1> P;           // number of predictors
+  matrix[N, P] x;           // predictor matrix
+  int<lower=1,upper=G> g[N]; // player assignment for each observation
+  int<lower=1,upper=C> c[N]; // course assignment for each observation
+
+  vector[G] mu0;            // prior means for player intercepts
+  vector[G] sigma0;         // prior std devs for player intercepts
+}
+
+parameters {
+  // Fixed effects
+  vector[P] beta;           // fixed-effect coefficients
+
+  // Player-level effects
+  vector[G] mu_g;           // player-specific intercepts
+
+  // Course-level effects
+  vector[C] mu_c;           // course-specific intercepts
+  vector[P] beta_c[C];      // course-specific slopes
+}
+
+model {
+  // Priors on fixed effects
+  beta ~ normal(0, 2);
+
+  // Player-level priors
+  for (l in 1:G) {
+    mu_g[l] ~ normal(mu0[l], sigma0[l]);
+  }
+
+  // Course-level priors
+  mu_c ~ normal(0, 2);      // course intercept priors
+
+  for (k in 1:C) {
+    beta_c[k] ~ normal(0, 4);
+  }
+
+  // Likelihood
+  for (n in 1:N) {
+    // linear predictor:
+    // include player intercept, course intercept, fixed effects,
+    // fixed coefficients, and course-specific coefficients
+    real lambda = mu_g[g[n]]
+               + mu_c[c[n]]
+               + dot_product(beta, x[n])
+               + dot_product(beta_c[c[n]], x[n]);
+
+    y[n] ~ poisson_log(lambda);
+  }
+}
+```
+
+### Conclusions 
+
+The goal of this document was to display skills in specifying Bayesian models. We successfully built a hierarchical bayesian model which one can use to simulate a round of golf conditional on golfer. We could compare 95% credible intervals for all golfers in the sample to identify the best based on who has the lowest credible interval. 
